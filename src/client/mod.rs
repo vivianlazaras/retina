@@ -25,7 +25,7 @@ use pin_project::pin_project;
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 #[cfg(feature = "rustls")]
-use tokio_rustls::{rustls::client::ClientConfig, TlsConnector, client::TlsStream};
+use tokio_rustls::{TlsConnector, client::TlsStream, rustls::{RootCertStore, client::ClientConfig}};
 use url::Url;
 
 use crate::client::parse::SessionHeader;
@@ -1285,7 +1285,9 @@ impl RtspsConnection {
         let tls = options
             .tls
             .clone()
-            .ok_or(std::io::Error::other("TLS not set in RtspsConnection::connect"))
+            .ok_or(std::io::Error::other(
+                "TLS not set in RtspsConnection::connect",
+            ))
             .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
         let connector = tokio_rustls::TlsConnector::from(tls);
         Self::with_connector(url, options, connector).await
@@ -1356,7 +1358,82 @@ enum ResponseMode {
 /// All `Session` operations are currently expected to be performed from
 /// "within" a tokio runtime with both time and I/O resource drivers enabled.
 /// Operations may panic or fail otherwise.
-pub struct Session<S: State, T: NetStream + 'static = tokio::net::TcpStream>(Pin<Box<SessionInner<T>>>, S);
+pub struct Session<S: State, T: NetStream + 'static = tokio::net::TcpStream>(
+    Pin<Box<SessionInner<T>>>,
+    S,
+);
+
+#[cfg(feature = "rustls")]
+pub enum RtspSession {
+    Session(Session<Described>),
+    #[cfg(feature = "rustls")]
+    Tls(Session<Described, tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
+}
+
+#[cfg(feature = "rustls")]
+impl RtspSession {
+    #[cfg(feature = "rustls")]
+    pub async fn new(url: &Url, opts: SessionOptions) -> Result<Self, Error> {
+        match url.as_str() {
+            "rtsp" => Ok(Self::create_session(url, opts).await?),
+            "rtsps" => Ok(Self::create_tls_session(url, opts).await?),
+            val => panic!("unexepcted schema: {}", val),
+        }
+    }
+
+    #[cfg(not(feature = "rustls"))]
+    pub async fn new(url: &Url, opts: SessionOptions) -> Result<Self, Error> {
+        match url.as_str() {
+            "rtsp" => Ok(Self::create_session(url, opts).await?),
+            val => panic!("unexepcted schema: {}", val),
+        }
+    }
+    pub async fn create_session(url: &Url, opts: SessionOptions) -> Result<Self, Error> {
+        let session = crate::client::Session::describe(url.clone(), opts).await?;
+        Ok(Self::Session(session))
+    }
+
+    #[cfg(feature = "rustls")]
+    pub async fn create_tls_session(url: &Url, opts: SessionOptions) -> Result<Self, Error> {
+        let session_group = Arc::new(crate::client::SessionGroup::default());
+
+        let mut root_store = RootCertStore::empty();
+
+        // 2. Populate it with Mozilla's trusted root certificates from webpki-roots
+        root_store.roots = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect::<Vec<_>>();
+
+        // 3. Build the ClientConfig using the webpki verifier and no client auth
+        let config = ClientConfig::builder()
+            // Provide the root certificates (uses WebPkiServerVerifier internally)
+            .with_root_certificates(root_store)
+            // Specify that the client will not present a client certificate
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(config));
+        let stream =
+            crate::client::Session::describe_with_connector(url.clone(), connector, opts).await?;
+        Ok(Self::Tls(stream))
+    }
+
+    /// Forwards the setup call to the active session variant
+    pub async fn setup(&mut self, stream_i: usize, options: SetupOptions) -> Result<(), Error> {
+        match self {
+            RtspSession::Session(session) => session.setup(stream_i, options).await,
+            #[cfg(feature = "rustls")]
+            RtspSession::Tls(session) => session.setup(stream_i, options).await,
+        }
+    }
+
+    /// Returns the slice of streams from the active session
+    pub fn streams(&self) -> &[Stream] {
+        match self {
+            RtspSession::Session(session) => session.streams(),
+            #[cfg(feature = "rustls")]
+            RtspSession::Tls(session) => session.streams(),
+        }
+    }
+
+    //pub async fn setup(&mut self, stream_i: usize, options: SetupOptions) -> Result<(), Error> {}
+}
 
 #[pin_project(PinnedDrop)]
 struct SessionInner<T: NetStream + 'static> {
@@ -1465,9 +1542,9 @@ impl RtspConnection {
 
 impl<T: NetStream> RtspNetConnection<T> {
     fn validate_url(url: &Url) -> Result<url::Host<&str>, String> {
-        if url.scheme() != "rtsp" {
+        if url.scheme() != "rtsp" || url.scheme() != "rtsps" {
             return Err(format!(
-                "Bad URL {}; only scheme rtsp supported",
+                "Bad URL {}; only scheme rtsp or rtsps supported",
                 url.as_str()
             ));
         }
@@ -1720,7 +1797,7 @@ impl<T: NetStream> RtspNetConnection<T> {
 
 const DEFAULT_USER_AGENT: &str = concat!("retina_", env!("CARGO_PKG_VERSION"));
 
-impl<S: State> Session<S> {
+impl<S: State, T: NetStream + 'static> Session<S, T> {
     /// Returns the available streams as described by the server.
     pub fn streams(&self) -> &[Stream] {
         &self.0.presentation.streams
@@ -1746,7 +1823,11 @@ impl Session<Described, TlsStream<tokio::net::TcpStream>> {
     /// Expects to be called from a tokio runtime.
     ///
     /// Unlike describe this method supports TLS (RTSPS) by providing an explicit [`tokio_rustls::TlsConnector`]
-    pub async fn describe_with_connector(url: Url, connector: TlsConnector, options: SessionOptions) -> Result<Self, Error> {
+    pub async fn describe_with_connector(
+        url: Url,
+        connector: TlsConnector,
+        options: SessionOptions,
+    ) -> Result<Self, Error> {
         let conn = RtspNetConnection::with_connector(&url, &options, connector).await?;
         Self::describe_with_conn(conn, options, url).await
     }
@@ -3667,8 +3748,8 @@ impl futures::Stream for Demuxed {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::testutil::{init_logging, response};
+    use *;
 
     /// Cross-platform, tokio equivalent of `socketpair(2)`.
     async fn socketpair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {

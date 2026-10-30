@@ -18,7 +18,7 @@ rust-version = "1.88"
 [features]
 default = ["h265"]
 h265 = []
-rustls = ["dep:tokio-rustls", "dep:rustls-pki-types"]
+rustls = ["dep:tokio-rustls", "dep:rustls-pki-types", "webpki-roots"]
 
 [package.metadata.docs.rs]
 # https://docs.rs/about/metadata
@@ -48,6 +48,7 @@ socket2 = "0.5"
 tokio = { version = "1.13.0", features = ["macros", "net", "rt", "sync", "time"] }
 tokio-rustls = { version = "0.26.6", optional = true }
 url = "2.2.1"
+webpki-roots = { version = "1.0.11", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.7.0", features = ["async_tokio"] }

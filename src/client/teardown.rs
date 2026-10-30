@@ -6,9 +6,9 @@ use url::Url;
 
 use crate::rtsp::msg::{self, OwnedMessage, StatusCode};
 
-use super::{ResponseMode, RtspNetConnection, RtspConnection, SessionOptions, Tool};
-use crate::{Error, error::ErrorInt};
+use super::{ResponseMode, RtspConnection, RtspNetConnection, SessionOptions, Tool};
 use crate::tokio::NetStream;
+use crate::{Error, error::ErrorInt};
 
 const EXISTING_CONN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const FRESH_CONN_INITIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);

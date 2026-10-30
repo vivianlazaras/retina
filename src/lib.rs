@@ -58,6 +58,7 @@ pub mod codec;
 #[doc(hidden)]
 pub mod rtsp;
 mod tokio;
+pub use tokio::NetStream;
 
 use error::ErrorInt;
 

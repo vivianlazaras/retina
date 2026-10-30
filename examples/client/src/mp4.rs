@@ -23,7 +23,8 @@ use clap::Parser;
 use futures::{Future, StreamExt};
 use log::{debug, info, warn};
 use retina::{
-    client::{SetupOptions, Transport},
+    NetStream,
+    client::{Described, Session, SetupOptions, State, Transport},
     codec::{AudioParameters, CodecItem, ParametersRef, VideoParameters},
 };
 
@@ -35,6 +36,8 @@ use tokio::{
     fs::File,
     io::{AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
 };
+#[cfg(feature = "rustls")]
+use tokio_rustls::{TlsConnector, rustls::ClientConfig};
 
 #[derive(Parser)]
 pub struct Opts {
@@ -691,6 +694,65 @@ async fn write_mp4(
     }
 }
 
+enum RtspSession {
+    Session(Session<Described>),
+    #[cfg(feature = "rustls")]
+    Tls(Session<S, tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
+}
+
+impl RtspSession {
+    #[cfg(feature = "rustls")]
+    pub async fn new(opts: &Opts) -> Result<Self, Error> {
+        match opts.src.url.as_str() {
+            "rtsp" => Ok(Self::create_session(opts).await?),
+            "rtsps" => Ok(Self::create_tls_session(opts).await?),
+            val => panic!("unexepcted schema: {}", val),
+        }
+    }
+    #[cfg(not(feature = "rustls"))]
+    pub async fn new(opts: &Opts) -> Result<Self, Error> {
+        match opts.src.url.as_str() {
+            "rtsp" => Ok(Self::create_session(opts).await?),
+            val => panic!("unexepcted schema: {}", val),
+        }
+    }
+    async fn create_session(opts: &Opts) -> Result<Self, Error> {
+        let creds = super::creds(opts.src.username.clone(), opts.src.password.clone());
+        let session_group = Arc::new(retina::client::SessionGroup::default());
+
+        let session = retina::client::Session::describe(
+            opts.src.url.clone(),
+            retina::client::SessionOptions::default()
+                .creds(creds)
+                .session_group(session_group.clone())
+                .user_agent("Retina mp4 example".to_owned())
+                .teardown(opts.teardown),
+        )
+        .await?;
+        Ok(Self::Session(session))
+    }
+
+    #[cfg(feature = "rustls")]
+    async fn create_tls_session(opts: &Opts) -> Result<Self, Error> {
+        let creds = super::creds(opts.src.username.clone(), opts.src.password.clone());
+        let session_group = Arc::new(retina::client::SessionGroup::default());
+
+        let mut config = ClientConfig::default();
+        let connector = TlsConnector::from(Arc::new(config));
+        let stream = retina::client::Session::describe_with_connector(
+            opts.src.url.clone(),
+            connector,
+            retina::client::SessionOptions::default()
+                .creds(creds)
+                .session_group(session_group.clone())
+                .user_agent("Retina mp4 example".to_owned())
+                .teardown(opts.teardown),
+        )
+        .await?;
+        Ok(Self::Tls(stream))
+    }
+}
+
 pub async fn run(opts: Opts) -> Result<(), Error> {
     if matches!(opts.transport, Transport::Udp(_)) && !opts.allow_loss {
         warn!("Using --transport=udp without strongly recommended --allow-loss!");
@@ -699,15 +761,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     let creds = super::creds(opts.src.username.clone(), opts.src.password.clone());
     let stop_signal = Box::pin(tokio::signal::ctrl_c());
     let session_group = Arc::new(retina::client::SessionGroup::default());
-    let mut session = retina::client::Session::describe(
-        opts.src.url.clone(),
-        retina::client::SessionOptions::default()
-            .creds(creds)
-            .session_group(session_group.clone())
-            .user_agent("Retina mp4 example".to_owned())
-            .teardown(opts.teardown),
-    )
-    .await?;
+    let session = RtspSession::new(&opts).await?;
     let video_stream_i = if !opts.no_video {
         let s = session.streams().iter().position(|s| {
             if s.media() == "video" {
