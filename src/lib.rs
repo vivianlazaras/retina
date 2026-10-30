@@ -24,11 +24,14 @@ use std::time::{Instant, SystemTime};
 pub mod buf;
 mod error;
 mod hex;
+
 #[doc(hidden)]
 pub mod inputs;
 mod mostly_ascii;
 pub mod rtcp;
 pub mod rtp;
+#[cfg(feature = "rustls")]
+mod tls;
 
 /// This is exposed for the fuzz tests. It is not a stable interface.
 #[doc(hidden)]

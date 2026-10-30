@@ -17,12 +17,15 @@ use self::channel_mapping::*;
 pub use self::timeline::Timeline;
 use crate::inputs::Input;
 use crate::rtsp::msg::{self as msg, OwnedMessage, StatusCode};
+use crate::tokio::NetStream;
 use bytes::Bytes;
 use futures::{Future, SinkExt, Stream as _, StreamExt, ready};
 use log::{debug, trace, warn};
 use pin_project::pin_project;
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
+#[cfg(feature = "rustls")]
+use tokio_rustls::{rustls::client::ClientConfig, TlsConnector, client::TlsStream};
 use url::Url;
 
 use crate::client::parse::SessionHeader;
@@ -492,6 +495,8 @@ pub struct SessionOptions {
     receiver_reports: ReceiverReportPolicy,
     bind_addr: Option<std::net::IpAddr>,
     backchannel: bool,
+    #[cfg(feature = "rustls")]
+    tls: Option<Arc<ClientConfig>>,
 }
 
 /// Policy for handling data received on unassigned RTSP interleaved channels.
@@ -699,6 +704,11 @@ impl SessionOptions {
         self
     }
 
+    #[cfg(feature = "rustls")]
+    pub fn tls(mut self, client: ClientConfig) -> Self {
+        self.tls = Some(Arc::new(client));
+        self
+    }
     /// Binds outgoing connections (the RTSP TCP connection, and UDP data sockets when using UDP
     /// transport) to this local address. Useful when the host has several local addresses and the
     /// OS would otherwise pick a source address the server has no route back to (e.g. a link-local
@@ -1254,8 +1264,8 @@ pub struct Playing(());
 impl State for Playing {}
 
 /// The raw connection, without tracking session state.
-struct RtspConnection {
-    inner: crate::tokio::Connection,
+struct RtspNetConnection<S: NetStream> {
+    inner: crate::tokio::IOConnection<S>,
     channels: ChannelMappings,
 
     /// The next `CSeq` header value to use when sending an RTSP request.
@@ -1263,6 +1273,47 @@ struct RtspConnection {
 
     /// If Retina has received data on an unassigned RTSP interleaved data channel.
     seen_unassigned: bool,
+}
+
+type RtspConnection = RtspNetConnection<tokio::net::TcpStream>;
+#[cfg(feature = "rustls")]
+type RtspsConnection = RtspNetConnection<TlsStream<tokio::net::TcpStream>>;
+
+#[cfg(feature = "rustls")]
+impl RtspsConnection {
+    async fn connect(url: &Url, options: &SessionOptions) -> Result<Self, Error> {
+        let tls = options
+            .tls
+            .clone()
+            .ok_or(std::io::Error::other("TLS not set in RtspsConnection::connect"))
+            .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
+        let connector = tokio_rustls::TlsConnector::from(tls);
+        Self::with_connector(url, options, connector).await
+    }
+    async fn with_connector(
+        url: &Url,
+        options: &SessionOptions,
+        connector: tokio_rustls::TlsConnector,
+    ) -> Result<Self, Error> {
+        let host =
+            RtspConnection::validate_url(url).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
+        let port = url.port().unwrap_or(554);
+        let inner = crate::tokio::IOConnection::with_connector(
+            host,
+            port,
+            options.get_max_message_size(),
+            options.bind_addr,
+            connector,
+        )
+        .await
+        .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
+        Ok(Self {
+            inner,
+            channels: ChannelMappings::default(),
+            next_cseq: 1,
+            seen_unassigned: false,
+        })
+    }
 }
 
 /// Mode to use in `RtspConnection::send` when looking for a response.
@@ -1305,14 +1356,14 @@ enum ResponseMode {
 /// All `Session` operations are currently expected to be performed from
 /// "within" a tokio runtime with both time and I/O resource drivers enabled.
 /// Operations may panic or fail otherwise.
-pub struct Session<S: State>(Pin<Box<SessionInner>>, S);
+pub struct Session<S: State, T: NetStream + 'static = tokio::net::TcpStream>(Pin<Box<SessionInner<T>>>, S);
 
 #[pin_project(PinnedDrop)]
-struct SessionInner {
+struct SessionInner<T: NetStream + 'static> {
     /// The connection. Currently there's expected to always be a RTSP
     /// connection, even while playing a RTP/AVP/UDP session. The only
     /// exception is during drop.
-    conn: Option<RtspConnection>,
+    conn: Option<RtspNetConnection<T>>,
 
     options: SessionOptions,
     requested_auth: Option<http_auth::PasswordClient>,
@@ -1410,7 +1461,9 @@ impl RtspConnection {
             seen_unassigned: false,
         })
     }
+}
 
+impl<T: NetStream> RtspNetConnection<T> {
     fn validate_url(url: &Url) -> Result<url::Host<&str>, String> {
         if url.scheme() != "rtsp" {
             return Err(format!(
@@ -1680,6 +1733,25 @@ impl<S: State> Session<S> {
     }
 }
 
+#[cfg(feature = "rustls")]
+impl Session<Described, TlsStream<tokio::net::TcpStream>> {
+    /// Creates a new session from a `DESCRIBE` request on the given URL.
+    ///
+    /// This method is permissive; it will return success even if there are
+    /// errors in the SDP that would prevent one or more streams from being
+    /// depacketized correctly. If those streams are setup via
+    /// `Session<Described>::setup`, the erorrs in question will be ultimately
+    /// returned from `Stream<Playing>::demuxed`.
+    ///
+    /// Expects to be called from a tokio runtime.
+    ///
+    /// Unlike describe this method supports TLS (RTSPS) by providing an explicit [`tokio_rustls::TlsConnector`]
+    pub async fn describe_with_connector(url: Url, connector: TlsConnector, options: SessionOptions) -> Result<Self, Error> {
+        let conn = RtspNetConnection::with_connector(&url, &options, connector).await?;
+        Self::describe_with_conn(conn, options, url).await
+    }
+}
+
 impl Session<Described> {
     /// Creates a new session from a `DESCRIBE` request on the given URL.
     ///
@@ -1694,9 +1766,11 @@ impl Session<Described> {
         let conn = RtspConnection::connect(&url, &options).await?;
         Self::describe_with_conn(conn, options, url).await
     }
+}
 
+impl<T: NetStream + 'static> Session<Described, T> {
     async fn describe_with_conn(
-        mut conn: RtspConnection,
+        mut conn: RtspNetConnection<T>,
         options: SessionOptions,
         url: Url,
     ) -> Result<Self, Error> {
@@ -2052,7 +2126,7 @@ impl Session<Described> {
     /// If a [`StreamDirection::Sending`] stream has been set up, the request
     /// carries the ONVIF backchannel `Require` header, and the caller may send
     /// on it as soon as this returns.
-    pub async fn play(mut self, policy: PlayOptions) -> Result<Session<Playing>, Error> {
+    pub async fn play(mut self, policy: PlayOptions) -> Result<Session<Playing, T>, Error> {
         let inner = self.0.as_mut().project();
         let conn = inner
             .conn
@@ -3134,7 +3208,7 @@ impl Session<Playing> {
 }
 
 #[pin_project::pinned_drop]
-impl PinnedDrop for SessionInner {
+impl<T: NetStream + 'static> PinnedDrop for SessionInner<T> {
     fn drop(self: Pin<&mut Self>) {
         let this = self.project();
 

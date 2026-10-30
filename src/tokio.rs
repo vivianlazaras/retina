@@ -7,14 +7,21 @@
 
 use bytes::{Buf as _, BufMut as _, BytesMut};
 use futures::{Sink, Stream};
+use std::io::IoSliceMut;
+use std::net::SocketAddr;
 use std::time::Instant;
-use tokio::io::AsyncWrite;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UdpSocket};
+
+#[cfg(feature = "rustls")]
+use tokio_rustls::{TlsConnector, client::TlsStream};
 use url::Host;
 
 use crate::buf::MarkBuf;
 use crate::inputs::{Input as _, Split};
 use crate::rtsp::msg::OwnedMessage;
+#[cfg(feature = "rustls")]
+use crate::tls::servername_from_host;
 use crate::{Error, ErrorInt, RtspMessageContext};
 
 use super::{ConnectionContext, ReceivedMessage, WallTime};
@@ -34,9 +41,58 @@ const DEFAULT_READ_CAPACITY: usize = 64 * 1024;
 /// accepted, so the buffer may exceed this briefly.
 const WRITE_HIGH_WATER: usize = 4 * 1024;
 
+pub trait NetStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {
+    fn peer(&self) -> Result<SocketAddr, std::io::Error>;
+    fn local(&self) -> Result<SocketAddr, std::io::Error>;
+    fn stream_poll_read_ready(
+        &self,
+        ctx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>>;
+    fn stream_try_read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> std::io::Result<usize>;
+}
+
+impl NetStream for TcpStream {
+    fn peer(&self) -> Result<SocketAddr, std::io::Error> {
+        self.peer_addr()
+    }
+    fn local(&self) -> Result<SocketAddr, std::io::Error> {
+        self.local_addr()
+    }
+
+    fn stream_poll_read_ready(
+        &self,
+        ctx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.poll_read_ready(ctx)
+    }
+    fn stream_try_read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> std::io::Result<usize> {
+        self.try_read_vectored(bufs)
+    }
+}
+
+#[cfg(feature = "rustls")]
+impl<T: NetStream> NetStream for TlsStream<T> {
+    fn peer(&self) -> Result<SocketAddr, std::io::Error> {
+        self.get_ref().0.peer()
+    }
+    fn local(&self) -> Result<SocketAddr, std::io::Error> {
+        self.get_ref().0.local()
+    }
+
+    fn stream_poll_read_ready(
+        &self,
+        ctx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.get_ref().0.stream_poll_read_ready(ctx)
+    }
+    fn stream_try_read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> std::io::Result<usize> {
+        self.get_ref().0.stream_try_read_vectored(bufs)
+    }
+}
+
 /// A RTSP connection which implements `Stream`, `Sink`, and `Unpin`.
-pub(crate) struct Connection {
-    stream: TcpStream,
+pub(crate) struct IOConnection<C: NetStream> {
+    stream: C,
     ctx: ConnectionContext,
     parser: crate::rtsp::parse::Parser,
     read_buf: MarkBuf,
@@ -73,24 +129,50 @@ pub(crate) struct Connection {
     write_waiters: Vec<std::task::Waker>,
 }
 
-impl Connection {
-    pub(crate) async fn connect(
+pub(crate) type Connection = IOConnection<TcpStream>;
+#[cfg(feature = "rustls")]
+pub(crate) type TlsConnection = IOConnection<TlsStream<TcpStream>>;
+
+#[cfg(feature = "rustls")]
+impl TlsConnection {
+    pub(crate) async fn with_connector(
         host: Host<&str>,
         port: u16,
         max_message_size: usize,
         bind_addr: Option<std::net::IpAddr>,
+        connector: TlsConnector,
     ) -> Result<Self, std::io::Error> {
+        let server = servername_from_host(&host)?;
         let stream = match bind_addr {
             None => match host {
-                Host::Domain(h) => TcpStream::connect((h, port)).await,
-                Host::Ipv4(h) => TcpStream::connect((h, port)).await,
-                Host::Ipv6(h) => TcpStream::connect((h, port)).await,
+                Host::Domain(h) => {
+                    connector
+                        .connect(server, TcpStream::connect((h, port)).await?)
+                        .await
+                }
+                Host::Ipv4(h) => {
+                    connector
+                        .connect(server, TcpStream::connect((h, port)).await?)
+                        .await
+                }
+                Host::Ipv6(h) => {
+                    connector
+                        .connect(server, TcpStream::connect((h, port)).await?)
+                        .await
+                }
             }?,
-            Some(local) => Self::connect_bound(host, port, local).await?,
+            Some(local) => {
+                connector
+                    .connect(server, Self::connect_bound(host, port, local).await?)
+                    .await?
+            }
         };
+
         Self::from_stream(stream, max_message_size)
     }
+}
 
+impl<T: NetStream> IOConnection<T> {
     /// Connects to `host:port` from the local address `local` (port chosen by the OS).
     async fn connect_bound(
         host: Host<&str>,
@@ -122,14 +204,10 @@ impl Connection {
             )
         }))
     }
-
-    pub(crate) fn from_stream(
-        stream: TcpStream,
-        max_message_size: usize,
-    ) -> Result<Self, std::io::Error> {
+    pub(crate) fn from_stream(stream: T, max_message_size: usize) -> Result<Self, std::io::Error> {
         let established_wall = WallTime::now();
-        let local_addr = stream.local_addr()?;
-        let peer_addr = stream.peer_addr()?;
+        let local_addr = stream.local()?;
+        let peer_addr = stream.peer()?;
         Ok(Self {
             stream,
             ctx: ConnectionContext {
@@ -288,6 +366,25 @@ impl Connection {
     }
 }
 
+impl Connection {
+    pub(crate) async fn connect(
+        host: Host<&str>,
+        port: u16,
+        max_message_size: usize,
+        bind_addr: Option<std::net::IpAddr>,
+    ) -> Result<Self, std::io::Error> {
+        let stream = match bind_addr {
+            None => match host {
+                Host::Domain(h) => TcpStream::connect((h, port)).await,
+                Host::Ipv4(h) => TcpStream::connect((h, port)).await,
+                Host::Ipv6(h) => TcpStream::connect((h, port)).await,
+            }?,
+            Some(local) => Self::connect_bound(host, port, local).await?,
+        };
+        Self::from_stream(stream, max_message_size)
+    }
+}
+
 /// Tries to decode a message from the read buffer without I/O.
 ///
 /// Separated from `Connection` methods to avoid self-borrow issues.
@@ -365,7 +462,7 @@ enum CodecError {
     ParseError { description: String, pos: u64 },
 }
 
-impl Stream for Connection {
+impl<T: NetStream> Stream for IOConnection<T> {
     type Item = Result<ReceivedMessage, Error>;
 
     fn poll_next(
@@ -390,7 +487,7 @@ impl Stream for Connection {
 
             // Need more data. Read from the stream into the ring buffer
             // using vectored I/O to fill both halves of the ring.
-            match this.stream.poll_read_ready(cx) {
+            match this.stream.stream_poll_read_ready(cx) {
                 std::task::Poll::Ready(Ok(())) => {}
                 std::task::Poll::Ready(Err(error)) => {
                     let pos = this.parser.stream_pos() + this.read_buf.unparsed_len() as u64;
@@ -411,7 +508,7 @@ impl Stream for Connection {
                 std::io::IoSliceMut::new(first),
                 std::io::IoSliceMut::new(second),
             ];
-            match this.stream.try_read_vectored(&mut bufs) {
+            match this.stream.stream_try_read_vectored(&mut bufs) {
                 Ok(0) => {
                     // EOF. Try decode with eof=true.
                     return match try_decode(&mut this.parser, &mut this.read_buf, true) {
@@ -487,7 +584,7 @@ fn codec_err_to_error(
 ///
 /// Once a write fails, the connection is unusable for writing: `start_send`,
 /// `poll_flush`, and `poll_close` return errors without writing anything more.
-impl Sink<OwnedMessage> for Connection {
+impl<T: NetStream> Sink<OwnedMessage> for IOConnection<T> {
     type Error = ErrorInt;
 
     fn poll_ready(

@@ -6,8 +6,9 @@ use url::Url;
 
 use crate::rtsp::msg::{self, OwnedMessage, StatusCode};
 
-use super::{ResponseMode, RtspConnection, SessionOptions, Tool};
+use super::{ResponseMode, RtspNetConnection, RtspConnection, SessionOptions, Tool};
 use crate::{Error, error::ErrorInt};
+use crate::tokio::NetStream;
 
 const EXISTING_CONN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const FRESH_CONN_INITIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -16,7 +17,7 @@ const FRESH_CONN_MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// Handles `TEARDOWN` loop in the background, removing the stale session entry on success or
 /// session expiry.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn background_teardown(
+pub(super) async fn background_teardown<T: NetStream + 'static>(
     seqnum: Option<u64>,
     base_url: Url,
     tool: Option<Tool>,
@@ -25,7 +26,7 @@ pub(super) async fn background_teardown(
     just_try_once: bool,
     options: SessionOptions,
     requested_auth: Option<http_auth::PasswordClient>,
-    conn: Option<RtspConnection>,
+    conn: Option<RtspNetConnection<T>>,
     mut tx: tokio::sync::watch::Sender<Option<Result<(), Error>>>,
     expires: tokio::time::Instant,
 ) {
@@ -76,7 +77,7 @@ pub(super) async fn background_teardown(
 
 /// Attempts `TEARDOWN` in a loop until success; caller should bound by session expiry.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn teardown_loop_forever(
+pub(super) async fn teardown_loop_forever<T: NetStream>(
     url: Url,
     tool: Option<Tool>,
     session_id: &msg::HeaderValue,
@@ -84,7 +85,7 @@ pub(super) async fn teardown_loop_forever(
     just_try_once: bool,
     options: &SessionOptions,
     mut requested_auth: Option<http_auth::PasswordClient>,
-    mut conn: Option<RtspConnection>,
+    mut conn: Option<RtspNetConnection<T>>,
     tx: &mut tokio::sync::watch::Sender<Option<Result<(), Error>>>,
 ) {
     let mut headers: msg::Headers = [(msg::HeaderName::SESSION, session_id.clone())].into();
@@ -195,12 +196,12 @@ pub(super) async fn teardown_loop_forever(
 }
 
 /// Makes a single attempt on the supplied connection; caller is responsible for the timeout.
-async fn attempt(
+async fn attempt<T: NetStream>(
     req: &mut OwnedMessage,
     tool: Option<&Tool>,
     options: &SessionOptions,
     requested_auth: &mut Option<http_auth::PasswordClient>,
-    mut conn: RtspConnection,
+    mut conn: RtspNetConnection<T>,
 ) -> Result<StatusCode, Error> {
     let e = match conn
         .send(ResponseMode::Teardown, options, tool, requested_auth, req)

@@ -18,6 +18,7 @@ rust-version = "1.88"
 [features]
 default = ["h265"]
 h265 = []
+rustls = ["dep:tokio-rustls", "dep:rustls-pki-types"]
 
 [package.metadata.docs.rs]
 # https://docs.rs/about/metadata
@@ -40,10 +41,12 @@ memchr = "2.7.4"
 pin-project = "1.0.7"
 pretty-hex = "0.4.0"
 rand = "0.8.3"
+rustls-pki-types = { version = "1.14.1", optional = true }
 sdp-types = "0.2.0"
 smallvec = { version = "1.6.1", features = ["union"] }
 socket2 = "0.5"
 tokio = { version = "1.13.0", features = ["macros", "net", "rt", "sync", "time"] }
+tokio-rustls = { version = "0.26.6", optional = true }
 url = "2.2.1"
 
 [dev-dependencies]
@@ -62,3 +65,4 @@ harness = false
 [[bench]]
 name = "depacketize"
 harness = false
+
