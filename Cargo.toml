@@ -16,9 +16,12 @@ include = ["src/**/*", "benches", "Cargo.toml"]
 rust-version = "1.88"
 
 [features]
-default = ["h265"]
+default = ["h265", "aws-lc-rs"]
 h265 = []
 rustls = ["dep:tokio-rustls", "dep:rustls-pki-types", "webpki-roots"]
+dangerous = ["rustls"]
+ring = ["rustls", "tokio-rustls/ring"]
+aws-lc-rs = ["rustls", "tokio-rustls/aws-lc-rs"]
 
 [package.metadata.docs.rs]
 # https://docs.rs/about/metadata

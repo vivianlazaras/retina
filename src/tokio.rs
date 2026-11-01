@@ -9,10 +9,15 @@ use bytes::{Buf as _, BufMut as _, BytesMut};
 use futures::{Sink, Stream};
 use std::io::IoSliceMut;
 use std::net::SocketAddr;
+use std::pin::pin;
+use std::task::{Context, Poll};
 use std::time::Instant;
+use std::{io, io::ErrorKind};
+use tokio::io::ReadBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UdpSocket};
 
+use pin_project::pin_project;
 #[cfg(feature = "rustls")]
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use url::Host;
@@ -44,11 +49,11 @@ const WRITE_HIGH_WATER: usize = 4 * 1024;
 pub trait NetStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {
     fn peer(&self) -> Result<SocketAddr, std::io::Error>;
     fn local(&self) -> Result<SocketAddr, std::io::Error>;
-    fn stream_poll_read_ready(
+    /*fn stream_poll_read_ready(
         &self,
         ctx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>>;
-    fn stream_try_read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> std::io::Result<usize>;
+    fn stream_try_read_vectored(&mut self, ctx: &mut Context<'_>, bufs: &mut [IoSliceMut<'_>]) -> std::io::Result<usize>;*/
 }
 
 impl NetStream for TcpStream {
@@ -58,16 +63,16 @@ impl NetStream for TcpStream {
     fn local(&self) -> Result<SocketAddr, std::io::Error> {
         self.local_addr()
     }
-
+    /*
     fn stream_poll_read_ready(
         &self,
         ctx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         self.poll_read_ready(ctx)
     }
-    fn stream_try_read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> std::io::Result<usize> {
+    fn stream_try_read_vectored(&mut self, ctx: &mut Context<'_>, bufs: &mut [IoSliceMut<'_>]) -> std::io::Result<usize> {
         self.try_read_vectored(bufs)
-    }
+    }*/
 }
 
 #[cfg(feature = "rustls")]
@@ -78,20 +83,45 @@ impl<T: NetStream> NetStream for TlsStream<T> {
     fn local(&self) -> Result<SocketAddr, std::io::Error> {
         self.get_ref().0.local()
     }
-
+    /*
     fn stream_poll_read_ready(
         &self,
         ctx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        self.get_ref().0.stream_poll_read_ready(ctx)
+
     }
-    fn stream_try_read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> std::io::Result<usize> {
-        self.get_ref().0.stream_try_read_vectored(bufs)
-    }
+    fn stream_try_read_vectored(&mut self, ctx: &mut std::task::Context<'_>, bufs: &mut [IoSliceMut<'_>]) -> std::io::Result<usize> {
+        // no where to read data into
+        if bufs.len() == 0 {
+            return Ok(0);
+        }
+
+        let total_len = bufs.iter().map(|v| v.len()).sum();
+        let mut read = 0;
+
+        for buf in bufs.iter_mut() {
+            let mut read_buf = ReadBuf::new(buf);
+            match std::pin::Pin::new(&mut *self).poll_read(ctx, &mut read_buf) {
+                Poll::Ready(Ok(())) => {
+                    read += read_buf.filled().len();
+                    if read >= total_len {
+                        return Ok(read);
+                    }
+                },
+                Poll::Ready(Err(e)) => return Err(e),
+                Poll::Pending => {
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                },
+            }
+        }
+        Ok(read)
+    }*/
 }
 
 /// A RTSP connection which implements `Stream`, `Sink`, and `Unpin`.
+#[pin_project]
 pub(crate) struct IOConnection<C: NetStream> {
+    #[pin]
     stream: C,
     ctx: ConnectionContext,
     parser: crate::rtsp::parse::Parser,
@@ -168,7 +198,8 @@ impl TlsConnection {
             }
         };
 
-        Self::from_stream(stream, max_message_size)
+        let res = Self::from_stream(stream, max_message_size);
+        res
     }
 }
 
@@ -208,6 +239,7 @@ impl<T: NetStream> IOConnection<T> {
         let established_wall = WallTime::now();
         let local_addr = stream.local()?;
         let peer_addr = stream.peer()?;
+        log::info!("in from_stream with type: {}", std::any::type_name::<T>());
         Ok(Self {
             stream,
             ctx: ConnectionContext {
@@ -469,7 +501,7 @@ impl<T: NetStream> Stream for IOConnection<T> {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        let this = &mut *self;
+        let mut this = self.project();
         loop {
             // Try decoding from existing buffered data.
             match try_decode(&mut this.parser, &mut this.read_buf, false) {
@@ -484,15 +516,58 @@ impl<T: NetStream> Stream for IOConnection<T> {
                     ))));
                 }
             }
-
+            
             // Need more data. Read from the stream into the ring buffer
             // using vectored I/O to fill both halves of the ring.
-            match this.stream.stream_poll_read_ready(cx) {
-                std::task::Poll::Ready(Ok(())) => {}
-                std::task::Poll::Ready(Err(error)) => {
+            let (first, second) = this.read_buf.spare_capacity(4096);
+            let first_len = first.len();
+            
+            let mut buf = if !first.is_empty() {
+                ReadBuf::new(first)
+            } else {
+                ReadBuf::new(second)
+            };
+            if buf.remaining() == 0 {
+                match try_decode(&mut this.parser, &mut this.read_buf, false) {
+                    Ok(Some(msg)) => return std::task::Poll::Ready(Some(Ok(msg))),
+                    Ok(None) => {}
+                    Err(e) => {
+                        return std::task::Poll::Ready(Some(Err(codec_err_to_error(
+                            &this.ctx,
+                            &this.parser,
+                            &this.read_buf,
+                            e,
+                        ))));
+                    }
+                }
+                continue;
+            }
+            match this.stream.as_mut().poll_read(cx, &mut buf) {
+                Poll::Ready(Ok(())) => {
+                    let len = buf.filled().len();
+                    if len == 0 {
+                        return match try_decode(&mut this.parser, &mut this.read_buf, true) {
+                            Ok(Some(msg)) => std::task::Poll::Ready(Some(Ok(msg))),
+                            Ok(None) => std::task::Poll::Ready(None),
+                            Err(e) => std::task::Poll::Ready(Some(Err(codec_err_to_error(
+                                &this.ctx,
+                                &this.parser,
+                                &this.read_buf,
+                                e,
+                            )))),
+                        };
+                    }
+                    this.read_buf.advance_end(len);
+                    continue;
+                }
+                Poll::Ready(Err(error)) => {
+                    if error.kind() == std::io::ErrorKind::WouldBlock {
+                        // Spurious readiness; re-register and wait.
+                        continue;
+                    }
                     let pos = this.parser.stream_pos() + this.read_buf.unparsed_len() as u64;
                     return std::task::Poll::Ready(Some(Err(wrap!(ErrorInt::RtspReadError {
-                        conn_ctx: this.ctx,
+                        conn_ctx: *this.ctx,
                         msg_ctx: RtspMessageContext {
                             pos,
                             received_wall: WallTime::now(),
@@ -501,14 +576,10 @@ impl<T: NetStream> Stream for IOConnection<T> {
                         source: error,
                     }))));
                 }
-                std::task::Poll::Pending => return std::task::Poll::Pending,
+                Poll::Pending => return Poll::Pending,
             }
-            let (first, second) = this.read_buf.spare_capacity(4096);
-            let mut bufs = [
-                std::io::IoSliceMut::new(first),
-                std::io::IoSliceMut::new(second),
-            ];
-            match this.stream.stream_try_read_vectored(&mut bufs) {
+            /*
+            match this.stream.stream_try_read_vectored(cx, &mut bufs) {
                 Ok(0) => {
                     // EOF. Try decode with eof=true.
                     return match try_decode(&mut this.parser, &mut this.read_buf, true) {
@@ -542,8 +613,9 @@ impl<T: NetStream> Stream for IOConnection<T> {
                         source: error,
                     }))));
                 }
-            }
+            }*/
         }
+        Poll::Ready(None)
     }
 }
 

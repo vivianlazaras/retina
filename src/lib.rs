@@ -33,6 +33,9 @@ pub mod rtp;
 #[cfg(feature = "rustls")]
 mod tls;
 
+#[cfg(feature = "dangerous")]
+pub use tls::dangerous::AcceptSelfSigned;
+
 /// This is exposed for the fuzz tests. It is not a stable interface.
 #[doc(hidden)]
 pub mod testutil;

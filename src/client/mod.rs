@@ -8,6 +8,7 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
+use std::ops::DerefMut;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Instant;
@@ -16,7 +17,10 @@ use std::{fmt::Debug, num::NonZeroU16, pin::Pin};
 use self::channel_mapping::*;
 pub use self::timeline::Timeline;
 use crate::inputs::Input;
+
 use crate::rtsp::msg::{self as msg, OwnedMessage, StatusCode};
+#[cfg(feature = "rustls")]
+use crate::tls::default_client_config;
 use crate::tokio::NetStream;
 use bytes::Bytes;
 use futures::{Future, SinkExt, Stream as _, StreamExt, ready};
@@ -25,7 +29,7 @@ use pin_project::pin_project;
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 #[cfg(feature = "rustls")]
-use tokio_rustls::{TlsConnector, client::TlsStream, rustls::{RootCertStore, client::ClientConfig}};
+use tokio_rustls::{TlsConnector, client::TlsStream, rustls::client::ClientConfig};
 use url::Url;
 
 use crate::client::parse::SessionHeader;
@@ -1290,7 +1294,10 @@ impl RtspsConnection {
             ))
             .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
         let connector = tokio_rustls::TlsConnector::from(tls);
-        Self::with_connector(url, options, connector).await
+        let conn = Self::with_connector(url, options, connector)
+            .await
+            .expect("creation failed");
+        Ok(conn)
     }
     async fn with_connector(
         url: &Url,
@@ -1308,7 +1315,8 @@ impl RtspsConnection {
             connector,
         )
         .await
-        .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
+        .map_err(|e| wrap!(ErrorInt::ConnectError(e)))
+        .expect("connection error");
         Ok(Self {
             inner,
             channels: ChannelMappings::default(),
@@ -1364,51 +1372,50 @@ pub struct Session<S: State, T: NetStream + 'static = tokio::net::TcpStream>(
 );
 
 #[cfg(feature = "rustls")]
-pub enum RtspSession {
-    Session(Session<Described>),
+pub enum RtspSession<S: State> {
+    Session(Session<S>),
     #[cfg(feature = "rustls")]
-    Tls(Session<Described, tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
+    Tls(Session<S, tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
 }
 
 #[cfg(feature = "rustls")]
-impl RtspSession {
+impl RtspSession<Described> {
     #[cfg(feature = "rustls")]
-    pub async fn new(url: &Url, opts: SessionOptions) -> Result<Self, Error> {
-        match url.as_str() {
-            "rtsp" => Ok(Self::create_session(url, opts).await?),
-            "rtsps" => Ok(Self::create_tls_session(url, opts).await?),
+    pub async fn describe(url: Url, opts: SessionOptions) -> Result<Self, Error> {
+        match url.scheme() {
+            "rtsp" => {
+                Ok(Self::describe_session(url, opts).await?)
+            }
+            "rtsps" => {
+                Ok(Self::describe_tls(url, opts).await?)
+            }
             val => panic!("unexepcted schema: {}", val),
         }
     }
 
+    // this function is the default when rustls isn't enabled
     #[cfg(not(feature = "rustls"))]
-    pub async fn new(url: &Url, opts: SessionOptions) -> Result<Self, Error> {
-        match url.as_str() {
-            "rtsp" => Ok(Self::create_session(url, opts).await?),
+    pub async fn describe(url: Url, opts: SessionOptions) -> Result<Self, Error> {
+        match url.scheme() {
+            "rtsp" => Ok(Self::describe_session(url, opts).await?),
             val => panic!("unexepcted schema: {}", val),
         }
     }
-    pub async fn create_session(url: &Url, opts: SessionOptions) -> Result<Self, Error> {
+
+    #[doc(hidden)]
+    pub async fn describe_session(url: Url, opts: SessionOptions) -> Result<Self, Error> {
         let session = crate::client::Session::describe(url.clone(), opts).await?;
         Ok(Self::Session(session))
     }
 
     #[cfg(feature = "rustls")]
-    pub async fn create_tls_session(url: &Url, opts: SessionOptions) -> Result<Self, Error> {
-        let session_group = Arc::new(crate::client::SessionGroup::default());
-
-        let mut root_store = RootCertStore::empty();
-
-        // 2. Populate it with Mozilla's trusted root certificates from webpki-roots
-        root_store.roots = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect::<Vec<_>>();
-
+    pub async fn describe_tls(url: Url, opts: SessionOptions) -> Result<Self, Error> {
         // 3. Build the ClientConfig using the webpki verifier and no client auth
-        let config = ClientConfig::builder()
-            // Provide the root certificates (uses WebPkiServerVerifier internally)
-            .with_root_certificates(root_store)
-            // Specify that the client will not present a client certificate
-            .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(config));
+        let config = match &opts.tls {
+            Some(tls) => tls.clone(),
+            None => default_client_config(),
+        };
+        let connector = TlsConnector::from(config);
         let stream =
             crate::client::Session::describe_with_connector(url.clone(), connector, opts).await?;
         Ok(Self::Tls(stream))
@@ -1432,7 +1439,55 @@ impl RtspSession {
         }
     }
 
+    pub async fn play(self, policy: PlayOptions) -> Result<RtspSession<Playing>, Error> {
+        Ok(match self {
+            Self::Tls(val) => RtspSession::Tls(val.play(policy).await?),
+            #[cfg(feature = "rustls")]
+            Self::Session(val) => RtspSession::Session(val.play(policy).await?),
+        })
+    }
+
     //pub async fn setup(&mut self, stream_i: usize, options: SetupOptions) -> Result<(), Error> {}
+}
+
+#[cfg(feature = "rustls")]
+impl RtspSession<Playing> {
+    pub fn demuxed(mut self) -> Result<RtspDemuxed, Error> {
+        Ok(match self {
+            Self::Tls(val) => RtspDemuxed::Tls(val.demuxed()?),
+            #[cfg(feature = "rustls")]
+            Self::Session(val) => RtspDemuxed::Session(val.demuxed()?),
+        })
+    }
+}
+
+#[cfg(feature = "rustls")]
+pub enum RtspDemuxed {
+    #[cfg(feature = "rustls")]
+    Tls(Demuxed<TlsStream<tokio::net::TcpStream>>),
+    Session(Demuxed<tokio::net::TcpStream>),
+}
+
+#[cfg(feature = "rustls")]
+impl RtspDemuxed {
+    /// Returns the server's version as declared in the `DESCRIBE` response's `a:tool` SDP
+    /// attribute.
+    pub fn tool(&self) -> Option<&Tool> {
+        match self {
+            #[cfg(feature = "rustls")]
+            Self::Tls(val) => val.tool(),
+            Self::Session(val) => val.tool(),
+        }
+    }
+
+    /// Returns the available streams as described by the server.
+    pub fn streams(&self) -> &[Stream] {
+        match self {
+            #[cfg(feature = "rustls")]
+            Self::Tls(val) => val.streams(),
+            Self::Session(val) => val.streams(),
+        }
+    }
 }
 
 #[pin_project(PinnedDrop)]
@@ -1542,10 +1597,11 @@ impl RtspConnection {
 
 impl<T: NetStream> RtspNetConnection<T> {
     fn validate_url(url: &Url) -> Result<url::Host<&str>, String> {
-        if url.scheme() != "rtsp" || url.scheme() != "rtsps" {
+        if url.scheme() != "rtsp" && url.scheme() != "rtsps" {
             return Err(format!(
-                "Bad URL {}; only scheme rtsp or rtsps supported",
-                url.as_str()
+                "Bad URL {}; only scheme rtsp or rtsps supported not: {}",
+                url.as_str(),
+                url.scheme()
             ));
         }
         if url.username() != "" || url.password().is_some() {
@@ -1855,6 +1911,7 @@ impl<T: NetStream + 'static> Session<Described, T> {
         options: SessionOptions,
         url: Url,
     ) -> Result<Self, Error> {
+        
         let mut headers: msg::Headers = [(
             msg::HeaderName::ACCEPT,
             msg::HeaderValue::try_from("application/sdp").unwrap(),
@@ -2581,11 +2638,11 @@ pub enum PacketItem {
     Rtcp(crate::rtcp::ReceivedCompoundPacket),
 }
 
-impl Session<Playing> {
+impl<T: NetStream + 'static> Session<Playing, T> {
     /// Returns a wrapper which demuxes/depacketizes into frames.
     ///
     /// Fails if a stream that has been setup can't be depacketized.
-    pub fn demuxed(mut self) -> Result<Demuxed, Error> {
+    pub fn demuxed(mut self) -> Result<Demuxed<T>, Error> {
         let inner = self.0.as_mut().project();
         let conn = inner
             .conn
@@ -3395,7 +3452,7 @@ impl futures::Stream for Session<Playing> {
     }
 }
 
-impl Session<Playing> {
+impl<T: NetStream + 'static> Session<Playing, T> {
     /// Queues `pkt` on its stream's RTP channel, plus an RTCP sender report if
     /// one is due. Implements [`futures::Sink::start_send`].
     fn queue_packet(mut self: Pin<&mut Self>, pkt: crate::rtp::SendingPacket) -> Result<(), Error> {
@@ -3478,7 +3535,7 @@ impl Session<Playing> {
 ///
 /// `poll_close` just flushes; it doesn't end the session. Drop the session to
 /// tear it down.
-impl futures::Sink<crate::rtp::SendingPacket> for Session<Playing> {
+impl<T: NetStream + 'static> futures::Sink<crate::rtp::SendingPacket> for Session<Playing, T> {
     type Error = Error;
 
     fn poll_ready(
@@ -3574,12 +3631,12 @@ enum DemuxedState {
 }
 
 /// Wrapper returned by [`Session<Playing>::demuxed`] which demuxes/depacketizes into frames.
-pub struct Demuxed {
+pub struct Demuxed<T: NetStream + 'static = tokio::net::TcpStream> {
     state: DemuxedState,
-    session: Session<Playing>,
+    session: Session<Playing, T>,
 }
 
-impl Demuxed {
+impl<T: NetStream + 'static> Demuxed<T> {
     /// Returns the server's version as declared in the `DESCRIBE` response's `a:tool` SDP
     /// attribute.
     pub fn tool(&self) -> Option<&Tool> {
@@ -3599,7 +3656,7 @@ impl Demuxed {
 /// As there, the caller must keep polling the [`futures::Stream`] impl (or
 /// drop the `Demuxed`) for keepalives to be sent and incoming data to be
 /// processed. To do both from separate tasks, use [`futures::StreamExt::split`].
-impl futures::Sink<crate::rtp::SendingPacket> for Demuxed {
+impl<T: NetStream + 'static> futures::Sink<crate::rtp::SendingPacket> for Demuxed<T> {
     type Error = Error;
 
     fn poll_ready(
@@ -3631,7 +3688,22 @@ impl futures::Sink<crate::rtp::SendingPacket> for Demuxed {
     }
 }
 
-impl futures::Stream for Demuxed {
+#[cfg(feature = "rustls")]
+impl futures::Stream for RtspDemuxed {
+    type Item = Result<CodecItem, Error>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        match self.deref_mut() {
+            #[cfg(feature = "rustls")]
+            Self::Tls(val) => val.poll_next_unpin(cx),
+            Self::Session(val) => val.poll_next_unpin(cx),
+        }
+    }
+}
+impl<T: NetStream + 'static> futures::Stream for Demuxed<T> {
     type Item = Result<CodecItem, Error>;
 
     fn poll_next(

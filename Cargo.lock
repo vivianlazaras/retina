@@ -620,6 +620,7 @@ dependencies = [
  "rcgen 0.14.7",
  "retina",
  "rustls",
+ "rustls-pki-types",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
