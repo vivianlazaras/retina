@@ -656,7 +656,7 @@ async fn write_mp4(
         .play(
             retina::client::PlayOptions::default()
                 .initial_timestamp(opts.initial_timestamp)
-                .enforce_timestamps_with_max_jump_secs(NonZeroU32::new(10).unwrap())
+                .enforce_timestamps_with_max_jump_secs(NonZeroU32::new(100).unwrap())
                 .unknown_rtcp_ssrc(opts.unknown_rtcp_ssrc),
         )
         .await?
